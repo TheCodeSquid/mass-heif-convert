@@ -1,305 +1,320 @@
-use anyhow::{Context, Result};
-use camino::{Utf8Path, Utf8PathBuf};
 use indexmap::IndexMap;
 use once_cell::sync::Lazy;
-
 use std::{
-    env, fmt,
-    fs::{self, File},
-    io::{self, BufWriter, Write},
+    env,
+    io::{self, BufWriter, Read, Write},
     process,
-    sync::mpsc::{self, Sender},
-    thread,
+    sync::Arc,
+};
+use tokio::{
+    sync::{
+        mpsc::{self, UnboundedReceiver, UnboundedSender},
+        Semaphore,
+    },
+    task,
+    time::{self, Duration},
 };
 
-use termion::{
-    color::Fg,
-    cursor,
-    event::Key,
-    input::TermRead,
-    raw::{IntoRawMode, RawTerminal},
-};
+use anyhow::{Context, Result};
+use camino::{Utf8Path, Utf8PathBuf};
 
-use heif::{ColorSpace, HeifContext, LibHeif, RgbChroma};
+use termion::{event::Key, raw::IntoRawMode};
+
+use heif::{HeifContext, LibHeif};
 use libheif_rs as heif;
+
+const MAX_FILE_HANDLES: usize = 10;
 
 static HEIF: Lazy<LibHeif> = Lazy::new(LibHeif::new);
 
-#[allow(unused)]
-enum Ping {
+#[derive(Clone, Debug)]
+enum Event {
+    Progress { id: usize, file: Utf8PathBuf },
+    Err { id: usize, err: String },
     Quit,
-    Status(usize, Status),
 }
 
-enum Status {
-    Init { total: usize },
-    Progress { file: Utf8PathBuf },
-}
-
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Entry {
     name: String,
-    file: Option<Utf8PathBuf>,
-    total: Option<usize>,
-    progress: usize,
+    last_file: Option<Utf8PathBuf>,
+    last_err: Option<String>,
+
+    total: usize,
+    completed: usize,
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let mut args = env::args().map(Utf8PathBuf::from).skip(1);
-    let input = args.next().expect("missing input directory argument");
-    let output = args.next().expect("missing output directory argument");
+    let input = args
+        .next()
+        .with_context(|| "missing input directory argument")?;
+    let output = args
+        .next()
+        .with_context(|| "missing output directory argument")?;
 
-    fs::create_dir(&output)
-        .with_context(|| format!("failed to create output directory {}", output))?;
+    if !output.exists() {
+        std::fs::create_dir(&output)?;
+    } else if output.read_dir()?.next().is_some() {
+        println!("warning: '{}' is not empty", output);
+        if !confirm("continue?") {
+            process::exit(1);
+        }
+    }
 
-    let subdirs = input
-        .read_dir_utf8()
-        .with_context(|| format!("failed to read input directory {}", input))?
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .filter(|entry| entry.path().file_name() != Some(".MISC"))
-        .collect::<Vec<_>>();
+    let (tx, rx) = mpsc::unbounded_channel::<Event>();
 
-    let mut pending = subdirs.len();
-    let (tx, rx) = mpsc::channel();
+    let entries = spawn_file_processors(tx.clone(), &input, &output)?;
 
-    ctrlc::set_handler({
-        let tx = tx.clone();
-        move || tx.send(Ping::Quit).unwrap()
-    })?;
-    thread::spawn({
-        let tx = tx.clone();
-        move || {
-            let stdin = io::stdin();
-            for key in stdin.keys() {
-                if matches!(key.unwrap(), Key::Ctrl('c')) {
-                    tx.send(Ping::Quit).unwrap();
+    task::spawn(async move {
+        let mut stdin = termion::async_stdin().bytes();
+        loop {
+            if let Some(byte) = stdin.next() {
+                let event = termion::event::parse_event(byte.unwrap(), &mut stdin).unwrap();
+                if matches!(event, termion::event::Event::Key(Key::Ctrl('c'))) {
+                    tx.send(Event::Quit).unwrap();
                     break;
                 }
             }
+            time::sleep(Duration::from_millis(50)).await;
         }
     });
 
-    let mut indices = IndexMap::new();
-
-    for (i, subdir) in subdirs.iter().enumerate() {
-        let path = subdir.path().to_owned();
-        let name = path.file_name().unwrap().to_string();
-        let out = Utf8PathBuf::from(&output);
-
-        indices.insert(i, name.clone());
-
-        let tx = tx.clone();
-
-        thread::Builder::new()
-            .name(name.clone())
-            .spawn(move || process_dir(i, tx, &path, &out.join(name)))?;
-    }
-
-    let names: IndexMap<_, _> = indices.sorted_by(|_, v1, _, v2| v1.cmp(v2)).collect();
-    log(format!("{:#?}", names));
-
     let mut stdout = io::stdout().into_raw_mode()?;
-    write!(
-        &mut stdout,
-        "{}{}",
-        termion::cursor::Hide,
-        vec!["\n"; names.len()].join("")
-    )?;
+    write!(&mut stdout, "{}", termion::cursor::Hide)?;
 
-    let mut entries: IndexMap<_, _> = names
-        .iter()
-        .map(|(k, v)| {
-            (
-                *k,
-                Entry {
-                    name: v.clone(),
-                    file: None,
-                    total: None,
-                    progress: 0,
-                },
-            )
-        })
-        .collect();
-
-    let mut quit = false;
-    while pending != 0 {
-        let ping = rx.recv()?;
-
-        match ping {
-            Ping::Quit => {
-                quit = true;
-                break;
-            }
-            Ping::Status(i, status) => match status {
-                Status::Init { total } => {
-                    entries.get_mut(&i).unwrap().total = Some(total);
-                    if total == 0 {
-                        pending -= 1;
-                    }
-                }
-                Status::Progress { file } => {
-                    let entry = entries.get_mut(&i).unwrap();
-                    entry.progress += 1;
-                    entry.file = Some(file);
-
-                    if entry.progress == entry.total.unwrap() {
-                        pending -= 1;
-                        entry.file = None;
-                    }
-                }
-            },
-        }
-
-        render_update(&mut stdout, &entries)?;
-    }
+    let status = event_loop(rx, entries, &mut stdout).await?;
 
     write!(&mut stdout, "{}", termion::cursor::Show)?;
-    drop(stdout);
-    println!();
-
-    if quit {
-        process::exit(1);
-    }
-    Ok(())
+    process::exit(status)
 }
 
-fn render_update<W: Write>(
-    stdout: &mut RawTerminal<W>,
-    entries: &IndexMap<usize, Entry>,
-) -> Result<()> {
-    let len = entries.len() as u16;
+async fn event_loop<W: Write>(
+    mut rx: UnboundedReceiver<Event>,
+    mut entries: IndexMap<usize, Entry>,
+    mut stdout: W,
+) -> Result<i32> {
+    let mut progress = entries.values().filter(|entry| entry.total > 0).count();
 
-    let mut buf = BufWriter::new(stdout);
-    write!(&mut buf, "{}", cursor::Up(len))?;
+    write!(&mut stdout, "{}", vec!["\n\r"; progress].join(""))?;
 
-    for entry in entries.values() {
-        let total_str = if let Some(total) = entry.total {
-            if total == 0 {
-                write!(&mut buf, "{}", Fg(termion::color::LightBlack))?;
-            } else if total == entry.progress {
-                write!(&mut buf, "{}", Fg(termion::color::LightGreen))?;
-            } else {
-                write!(&mut buf, "{}", Fg(termion::color::LightBlue))?;
+    loop {
+        let event = rx.recv().await.with_context(|| "event receiver closed")?;
+
+        let mut quit = false;
+
+        match event.clone() {
+            Event::Progress { id, file } => {
+                let entry = entries.get_mut(&id).unwrap();
+                entry.last_file = Some(file);
+                entry.last_err = None;
+
+                entry.completed += 1;
+                if entry.completed == entry.total {
+                    progress -= 1;
+                    entry.last_file = None;
+                }
             }
+            Event::Quit => {
+                quit = true;
+            }
+            Event::Err { id, err } => {
+                let entry = entries.get_mut(&id).unwrap();
+                entry.last_err = Some(err);
+                quit = true;
+            }
+        }
 
-            format!("{:04}", total)
+        render_update(&mut stdout, &entries.values().collect::<Vec<_>>())?;
+
+        if quit {
+            break Ok(1);
+        } else if progress == 0 {
+            break Ok(0);
+        }
+    }
+}
+
+fn render_update<W: Write>(stdout: W, entries: &[&Entry]) -> Result<()> {
+    let buf = &mut BufWriter::new(stdout);
+    write!(buf, "{}", termion::cursor::Up(entries.len() as u16))?;
+
+    for entry in entries {
+        let color = if entry.last_err.is_some() {
+            termion::color::Red.fg_str()
+        } else if entry.completed == entry.total {
+            termion::color::LightGreen.fg_str()
         } else {
-            "???".to_string()
+            termion::color::LightBlue.fg_str()
         };
 
-        let file = if let Some(file) = &entry.file {
-            format!("[{}]", file)
-        } else {
-            "".to_string()
-        };
+        let last_file = entry
+            .last_file
+            .as_ref()
+            .map(|file| format!(" [{}]", file))
+            .unwrap_or_default();
+        let last_err = entry.last_err.as_deref().unwrap_or_default();
 
         write!(
-            &mut buf,
-            "{}{} - {:04}/{}  {}\r\n{}",
+            buf,
+            "{}{}{} | {:04}/{:04} {} {}\r\n",
             termion::clear::CurrentLine,
+            color,
             entry.name,
-            entry.progress,
-            total_str,
-            file,
-            termion::color::Reset.fg_str(),
+            entry.completed,
+            entry.total,
+            last_file,
+            last_err
         )?;
     }
 
     Ok(())
 }
 
-fn process_dir(index: usize, tx: Sender<Ping>, path: &Utf8Path, out: &Utf8Path) {
-    fs::create_dir(out)
-        .with_context(|| format!("failed to create output subdirectory {}", out))
-        .unwrap();
+fn spawn_file_processors(
+    tx: UnboundedSender<Event>,
+    input: &Utf8Path,
+    output: &Utf8Path,
+) -> Result<IndexMap<usize, Entry>> {
+    let mut entries = IndexMap::new();
 
-    let entries = path
-        .read_dir_utf8()
-        .with_context(|| format!("failed to read input subdirectory {}", path))
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
+    for (id, dir) in input.read_dir_utf8()?.enumerate() {
+        let dir_path = dir?.into_path();
+        let dir_name = dir_path.file_name().unwrap().to_string();
+        if dir_name == ".MISC" {
+            continue;
+        }
 
-    tx.send(Ping::Status(
-        index,
-        Status::Init {
-            total: entries.len(),
-        },
-    ))
-    .unwrap();
+        let output = output.join(&dir_name);
+        if !output.exists() {
+            std::fs::create_dir(&output)?;
+        }
 
-    let entries = entries.into_iter().peekable();
+        let semaphore = Arc::new(Semaphore::new(MAX_FILE_HANDLES));
 
-    for entry in entries {
-        let path = entry.path().to_owned();
-        let name = path.file_name().unwrap().to_owned();
-        let ext = path.extension().unwrap().to_owned();
+        let mut total = 0;
+        for file in dir_path.read_dir_utf8()? {
+            total += 1;
 
-        let out = out.to_owned();
-        let tx = tx.clone();
+            let source = file?.into_path();
+            let file_name = source.file_name().unwrap();
+            let ext = source.extension();
 
-        rayon::spawn(move || {
-            if ext != "HEIC" {
-                fs::copy(&path, out.join(name)).unwrap();
+            let dest = if ext == Some("HEIC") {
+                output.join(file_name).with_extension("PNG")
             } else {
-                let path_png = path.with_extension("PNG");
-                let name_png = path_png.file_name().unwrap();
-                let mut file = File::create(out.join(name_png)).unwrap();
-                convert_heif(&path, &mut file)
-                    .with_context(|| format!("failed to convert image {}", path))
-                    .unwrap();
-            }
+                output.join(file_name)
+            };
 
-            tx.send(Ping::Status(index, Status::Progress { file: path }))
-                .unwrap();
-        });
+            let semaphore = semaphore.clone();
+            let tx = tx.clone();
+            task::spawn(async move {
+                let permit = semaphore.acquire().await.unwrap();
+                match process_file(&source, &dest).await {
+                    Ok(()) => {
+                        tx.send(Event::Progress {
+                            id,
+                            file: source.clone(),
+                        })
+                        .unwrap();
+                    }
+                    Err(err) => {
+                        tx.send(Event::Err {
+                            id,
+                            err: format!("{:#}", err),
+                        })
+                        .unwrap();
+                    }
+                }
+                drop(permit);
+            });
+        }
+
+        entries.insert(
+            id,
+            Entry {
+                name: dir_name,
+                last_file: None,
+                last_err: None,
+
+                total,
+                completed: 0,
+            },
+        );
     }
+
+    Ok(entries)
 }
 
-fn convert_heif<W: Write>(path: &Utf8Path, writer: W) -> Result<()> {
-    let ctx = HeifContext::read_from_file(path.as_str())?;
+async fn process_file(source: &Utf8Path, dest: &Utf8Path) -> Result<()> {
+    if source.extension() != Some("HEIC") {
+        tokio::fs::copy(source, dest).await?;
+    } else {
+        let source = source.to_owned();
+        let dest = dest.to_owned();
+
+        task::spawn_blocking(move || {
+            let file = std::fs::File::create(&dest)?;
+
+            heif_to_png(&source, file)?;
+
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+    }
+
+    Ok(())
+}
+
+fn heif_to_png<W: Write>(source: &Utf8Path, writer: W) -> Result<()> {
+    let ctx = HeifContext::read_from_file(source.as_str())?;
     let handle = ctx.primary_image_handle()?;
 
-    let image = HEIF.decode(&handle, ColorSpace::Rgb(RgbChroma::Rgb), None)?;
-
+    let image = HEIF.decode(&handle, heif::ColorSpace::Rgb(heif::RgbChroma::Rgb), None)?;
     let planes = image.planes();
     let plane = planes.interleaved.unwrap();
 
     let target_size = plane.width * plane.height * 3;
-    let chunk_size = if target_size as usize != plane.data.len() {
-        plane.data.len() / plane.height as usize
-    } else {
-        target_size as usize
-    };
-
-    let offset = if chunk_size == target_size as usize {
-        0
-    } else {
-        3
-    };
+    let actual_size = plane.data.len();
 
     let mut encoder = png::Encoder::new(writer, plane.width, plane.height);
     encoder.set_color(png::ColorType::Rgb);
-    encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_compression(png::Compression::Best);
 
     let mut writer = encoder.write_header()?;
-
-    if offset == 0 {
-        writer.stream_writer()?.write_all(plane.data)?;
+    if target_size as usize == actual_size {
+        log(format!("converting {} (full stream)", source));
+        let mut stream = writer.stream_writer()?;
+        stream.write_all(plane.data)?;
     } else {
-        let mut writer = writer.stream_writer_with_size(chunk_size)?;
-        for chunk in plane.data.chunks(chunk_size) {
-            writer.write_all(chunk)?;
+        log(format!("converting {} (chunked)", source));
+        let chunk_size = actual_size / plane.height as usize;
+        let mut stream = writer.stream_writer_with_size(chunk_size)?;
+        for chunk in plane.data.chunks_exact(chunk_size) {
+            stream.write_all(chunk)?;
         }
     }
+
+    log(format!("done converting {}", source));
     Ok(())
 }
 
-fn log<S: fmt::Display>(msg: S) {
-    let mut file = File::options()
-        .create(true)
+fn confirm(msg: &str) -> bool {
+    print!("{} [y/N]: ", msg);
+    io::stdout().flush().unwrap();
+
+    let mut res = String::new();
+    if io::stdin().read_line(&mut res).is_err() {
+        return false;
+    }
+    res.trim() == "y"
+}
+
+fn log(msg: impl std::fmt::Display) {
+    let mut file = std::fs::File::options()
         .append(true)
+        .create(true)
         .open("log.txt")
         .unwrap();
     writeln!(file, "{}", msg).unwrap();
