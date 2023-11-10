@@ -1,0 +1,15 @@
+[package]
+name = "mass-heif-convert"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+indexmap = "2.1"
+once_cell = "1.18"
+camino = "1.1"
+png = "0.17"
+libheif-rs = "0.22"
+termion = "2.0"
+ctrlc = { version = "3.4", features = ["termination"] }
+rayon = "1.8"
